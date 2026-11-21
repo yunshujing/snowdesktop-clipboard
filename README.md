@@ -6,7 +6,7 @@
 
 > 非官方组件。英文名「Clipboard」。
 
-> **仓库与工坊版本可能不同步。** 本仓库 `main` 跟随最新开发/测试宿主（当前 1.1.1，需要带剪贴板订阅接口的 SnowDesktop）；Steam 创意工坊只发布与**正式版宿主**兼容的版本（当前 1.0.4）。正式版尚未集成订阅接口前，工坊不会更新——使用正式版的用户请从工坊安装，测试版用户可以按「安装 → 作为开发组件」从本仓库安装。
+> **仓库与工坊已同步到 1.1.1。** Steam 正式分支 build 26833710 起已包含剪贴板订阅接口（`data.clipboard.changes`、`clipboard.observe`、`widget.panel`），因此 1.1.1 同时发布到本仓库与 Steam 创意工坊。宿主更旧（1.0.16 及更早，例如工坊历史版本 1.0.4 的用户）请先更新 SnowDesktop。
 
 ## 功能
 
@@ -58,7 +58,7 @@
 
 ## 兼容性
 
-- 需要支持 `data.clipboard.changes` 的 SnowDesktop 1.0.17.0 或更新版本（API v2）。旧宿主请使用组件 1.0.4。
+- 需要支持 `data.clipboard.changes` 的 SnowDesktop 1.0.17.0 或更新版本（API v2）。Steam 正式分支自 build 26833710 起已包含该接口；更旧的宿主请使用组件 1.0.4。
 - 支持 `data.clipboard.changes.image` 的宿主可以写回近期后台图片。只有基础订阅能力的宿主可通过右键标题手动读取并写回当前图片。
 - 图片去重需要宿主支持 `clipboard.imageIdentity`。
 - 直接拖出和复制文件地址分别检测 `interaction.dragImage` 和 `clipboard.filePaths`；宿主提供原始尺寸时按原图尺寸写回。
