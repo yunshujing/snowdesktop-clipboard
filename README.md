@@ -1,6 +1,6 @@
 # 剪贴板 — SnowDesktop 组件
 
-一个 [SnowDesktop](https://snowdesktop.com/) 桌面剪贴板历史板：自动记录文本、图片缩略图和文件名，支持筛选、置顶与一键写回文本。
+一个 [SnowDesktop](https://snowdesktop.com/) 桌面剪贴板历史板：自动记录文本、图片和文件名，支持筛选、置顶与写回文本和图片。
 
 <p align="center"><img src="preview.png" width="420" alt="剪贴板组件预览"></p>
 
@@ -8,11 +8,12 @@
 
 ## 功能
 
-- **文本自动记录**：在其它应用里复制后自动进入历史，链接与代码有独立图标；点条目即可把文本写回剪贴板。
+- **文本自动记录**：在其它应用里复制后自动进入历史，链接与代码有独立图标。
 - **搜索**：卡片内搜索框按关键词即时过滤全部历史（文本按全文匹配，图片和文件按标题匹配）。
-- **图片缩略图**：后台提取真实图片像素并生成 32px 缩略图；刷新按钮可读取宿主提供的完整图片句柄。
-- **文件记录**：显示文件展示名和数量；刷新按钮可补全宿主文件引用。
-- **每次复制独立成条**：重复复制同一张图片或同名文件也会新增记录，不会被覆盖。只有手动刷新会补全对应的那一条。
+- **预览与复制**：点击文本或图片条目打开预览。复制按钮与右键菜单可以把内容写回剪贴板。可用的图片还可拖到接收位图或 PNG 附件的窗口。
+- **编辑文字预览**：在多行文本框里编辑并复制所选文字。草稿随弹窗关闭而清除，原历史条目保留。支持 `view.textArea.largeValue` 的宿主可编辑现有 256 KiB 限额内的文本。
+- **文件记录**：显示文件展示名和数量。支持文件地址的宿主可以复制完整路径，多项各占一行。
+- **去重**：宿主提供图片内容 ID 或文件引用时，相同内容会更新原条目并保留置顶。
 - **图片优先识别**：剪贴板同时包含图片像素和 `CF_HDROP` 时优先按图片处理，不再把复制图片误记为文件。
 - **分类筛选**：全部 / 文本 / 图片 / 文件四个标签页；右键菜单可进一步按链接、代码过滤。
 - **置顶与删除**：置顶条目不会被历史容量淘汰；可单项删除或两步确认清空。
@@ -22,9 +23,8 @@
 
 ## 限制
 
-- 图片与文件条目是**只读会话记录**：宿主提供的是实例绑定的图片句柄和文件引用，不能持久化，也不能写回剪贴板；重载或重启后丢弃。
-- 暂时只有文本可以一键写回。
-- 后台自动监听需要授权可选的 `native.execute`，由组件自带的 `bin/clipwatch.exe` 读取 Win32 剪贴板。未授权时仍可用刷新按钮手动读取。
+- 图片和文件条目在当前会话内可用。支持原始尺寸的宿主会按原图尺寸写回和拖出图片。后台最多保留最近 8 张不同图片的可用资源，缓存也会按容量淘汰旧图。后台图片仍可通过缩略图预览。
+- 自动记录需要授予「在后台读取剪贴板内容」权限。右键标题可手动读取当前剪贴板。
 - Windows 的隐私剪贴板标记是应用间的协作约定，不是系统级访问控制；不遵守约定的第三方程序仍可能读取剪贴板。
 - 历史容量达到上限后，最旧的未置顶条目会被淘汰。
 
@@ -34,11 +34,11 @@
 
 1. 到本仓库的 [Releases](../../releases) 下载最新的 `clipboard.snowwidget`。
 2. SnowDesktop → **设置 → 组件 → 从文件安装…**，选择该文件。
-3. 首次运行按提示确认剪贴板读取、写入和本机执行权限。
+3. 首次运行按提示确认剪贴板读取、写入权限。需要自动记录时，同时允许后台读取。
 
 ### 作为开发组件
 
-把仓库内容（`widget.json`、`main.lua`、`modules/`、`bin/`、`tests/`、`preview.png`、`previews/`）放进：
+把仓库内容（`widget.json`、`main.lua`、`modules/`、`tests/`、`preview.png`、`previews/`）放进：
 
 ```
 <SnowDesktop 安装目录>\data\widgets\dev\clipboard\
@@ -50,17 +50,18 @@
 
 | 权限 | 用途 |
 | --- | --- |
-| `clipboard.read` | 用户点击后读取文本、完整图片或文件引用 |
-| `clipboard.write` | 将文本写回系统剪贴板 |
-| `native.execute`（可选） | 运行内置 `clipwatch.exe`，在其它程序复制后自动记录 |
-
-`clipwatch.exe` 通过 Win32 读取文本、图片像素和文件名；只发送有界缩略图与展示名，不发送文件路径，不写文件、不联网、不修改剪贴板。
+| `clipboard.read` | 用户点击后读取文本、图片或文件引用 |
+| `clipboard.write` | 将文本或图片写回系统剪贴板 |
+| `clipboard.observe`（可选） | 订阅剪贴板变更，自动记录文本、图片缩略图和文件展示名 |
 
 ## 兼容性
 
-- SnowDesktop 1.0.16.0 及以上（API v2）。
+- 需要支持 `data.clipboard.changes` 的 SnowDesktop 1.0.17.0 或更新版本（API v2）。旧宿主请使用组件 1.0.4。
+- 支持 `data.clipboard.changes.image` 的宿主可以写回近期后台图片。只有基础订阅能力的宿主可通过右键标题手动读取并写回当前图片。
+- 图片去重需要宿主支持 `clipboard.imageIdentity`。
+- 原始尺寸、直接拖出和复制文件地址分别检测 `clipboard.image.originalSize`、`interaction.dragImage` 和 `clipboard.filePaths`。
 - 无网络请求、无外部服务。
-- 核心能力：即时绘制、滚动区域、右键菜单、定时任务、本地化、组件存储、`task.native.watch`。
+- 核心能力：即时绘制、滚动区域、右键菜单、剪贴板订阅、定时任务、本地化和组件存储。
 
 ## 开发
 
@@ -71,8 +72,6 @@ snowwidget preview . preview.png --columns 3 --rows 3 --canvas-size 512 --paddin
 snowwidget quality .
 snowwidget pack    . clipboard.snowwidget
 snowwidget validate clipboard.snowwidget
-# 重新编译原生助手（Windows .NET Framework csc）：
-csc /target:exe /optimize+ /out:bin/clipwatch.exe src/clipwatch/ClipWatch.cs /reference:System.dll /reference:System.Drawing.dll
 ```
 
 ### 结构
@@ -80,18 +79,15 @@ csc /target:exe /optimize+ /out:bin/clipwatch.exe src/clipwatch/ClipWatch.cs /re
 ```
 main.lua                 组件生命周期、绘制、输入、宿主任务
 modules/clipboard.lua    纯数据模型：历史、筛选、合并、持久化编码
-modules/preview.lua      原生缩略图 base64/RGB 解码
+modules/preview.lua      将 RGB 缩略图转为绘制数据
 modules/storage.lua      原子存储事务
-bin/clipwatch.exe        C# Win32 常驻监听助手
-src/clipwatch/ClipWatch.cs  助手源码
 tests/                   snowwidget 单元测试
 ```
 
 ### 设计要点
 
-- 宿主 `clipboard.read` 只允许在可信指针手势内调用，因此后台监听由 `clipwatch` 常驻助手通过 `native.watch` 协议完成。
-- 助手每 300ms 检查一次剪贴板序列号；一次复制只发一个事件。文本、图片和文件在一次剪贴板锁内完成一致快照。
-- 每次原生事件直接追加历史；刷新任务携带当前监听条目 ID，只补全该条，不覆盖其它图片或文件。
+- 后台记录由宿主 `clipboard.changes` 订阅驱动。手动刷新在可信手势中调用 `clipboard.read`。
+- 每条已收到的图片或文件事件都会追加历史。刷新任务携带当前监听条目 ID，补全对应记录。
 - 历史文本使用 `entry.<timestamp>-<seq>` 存储键，插入与淘汰通过 `storage.transaction` 原子提交。
 
 ## License

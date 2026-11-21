@@ -195,9 +195,15 @@ function clipboard.copyEntry(item)
     return result
 end
 
--- Native image/file events are new history items, including repeated copies of
--- the same content. The optional refresh target lets one explicit host read
--- enrich that exact row without replacing any other same-kind entries.
+function clipboard.findImageEntryId(list, imageId)
+    for _, entry in ipairs(list) do
+        if entry.kind == "image" and entry.imageId == imageId then
+            return entry.id
+        end
+    end
+end
+
+-- Refresh the matching content or the selected file entry, preserving its pin and id.
 function clipboard.enrichSession(list, id, entry)
     local result, found = {}, false
     for index = 1, #list do
@@ -207,13 +213,17 @@ function clipboard.enrichSession(list, id, entry)
             merged.ts = entry.ts or item.ts
             if entry.kind == "image" then
                 merged.image = entry.image or item.image
+                merged.imageId = entry.imageId or item.imageId
                 merged.imageData = entry.imageData or item.imageData
                 merged.pixels = entry.pixels or item.pixels
-                merged.width = entry.width or item.width
-                merged.height = entry.height or item.height
+                if entry.image or not item.image then
+                    merged.width = entry.width or item.width
+                    merged.height = entry.height or item.height
+                end
             else
                 merged.names = entry.names or item.names
                 merged.items = entry.items or item.items
+                merged.pathRefs = entry.pathRefs or item.pathRefs
             end
             result[#result + 1] = merged
             found = true

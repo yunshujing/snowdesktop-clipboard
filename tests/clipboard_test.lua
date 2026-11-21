@@ -196,16 +196,15 @@ return {
     end,
 
     ["decodes bounded thumbnails and rejects malformed payloads"] = function()
-        local image = thumbnail.decode("/+4AAP7/", 2, 1)
+        local rgb = string.char(255, 238, 0, 0, 254, 255)
+        local image = thumbnail.decode(rgb, 2, 1)
         truthy(image and image.width == 2 and image.height == 1, "two RGB pixels")
         same(image.rows[1][1].color, 0xFFEE00, "first RGB color")
         same(image.rows[1][2].color, 0x00FEFF, "second RGB color")
-        same(thumbnail.decode("/+4AAP/=", 2, 1), nil, "nonzero base64 tail")
-        same(thumbnail.decode("/+4AAP7/AAAA", 2, 1), nil, "extra trailing bytes")
-        same(thumbnail.decode("/+4=AAAA", 2, 1), nil, "padding in the middle")
-        same(thumbnail.decode("/+4AAP7", 2, 1), nil, "incomplete base64")
-        same(thumbnail.decode("/+4AAP7/", 0, 1), nil, "invalid width")
-        same(thumbnail.decode("/+4AAP7/", 33, 1), nil, "oversized dimensions")
+        same(thumbnail.decode(rgb .. "a", 2, 1), nil, "extra trailing byte")
+        same(thumbnail.decode(rgb:sub(1, 5), 2, 1), nil, "incomplete RGB data")
+        same(thumbnail.decode(rgb, 0, 1), nil, "invalid width")
+        same(thumbnail.decode(rgb, 33, 1), nil, "oversized dimensions")
     end,
 
     ["keeps every image copy and enriches only the watched entry"] = function()
@@ -253,7 +252,7 @@ return {
             width = 12, height = 8 }
         local pinnedImage = clipboard.togglePin({ image }, "image", 200)[1]
         same(pinnedImage.image, "host-image", "host image retained")
-        same(pinnedImage.imageData, "pixels", "native thumbnail retained")
+        same(pinnedImage.imageData, "pixels", "thumbnail retained")
         same(pinnedImage.pixels.width, 12, "decoded thumbnail retained")
         local files = { id = "files", ts = 100, pinned = false, kind = "files",
             names = { "a.txt" }, items = { { name = "a.txt", ref = "opaque" } } }
