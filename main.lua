@@ -21,6 +21,7 @@ local SEMANTIC_METADATA = widget.hasFeature("interaction.accessibility.metadata"
 local SEARCH_INPUT = widget.hasFeature("control.textInput")
 local PREVIEW_EDITOR = widget.hasFeature("view.surface.panel") and
     widget.hasFeature("view.tree.core") and widget.hasFeature("view.inputControls")
+local PREVIEW_SCROLL = widget.hasFeature("view.scroll")
 local PREVIEW_TEXT_MAX_BYTES = widget.hasFeature("view.textArea.largeValue") and MAX_TEXT or 4096
 local WATCH_IMAGE = widget.hasFeature("data.clipboard.changes.image")
 local IMAGE_DRAG = widget.hasFeature("interaction.dragImage")
@@ -161,7 +162,7 @@ local function palette(snapshot)
         + (math.floor(accent / 256) % 256) * 0.587 + (accent % 256) * 0.114
     return {
         ink = light and 0x25252B or 0xF5F6F8,
-        muted = light and 0x575962 or 0xB7B9C3,
+        muted = light and 0x50525A or 0xB7B9C3,
         surface = light and 0xFFFFFF or 0x0A0A0D,
         accent = accent,
         accentInk = brightness > 165 and 0x1C1C1E or 0xFFFFFF,
@@ -211,11 +212,12 @@ end
 -- History and storage ------------------------------------------------------
 
 local storageError
+local toast
 
 -- Bulk deletes run through transactions in batches of 50 keys: 1.0.2 proved
 -- transactions of that size live, and 4-5 transactions stay far inside the
 -- host's 32-write burst budget even when clearing a 200-entry history.
--- minHostVersion 1.0.16 guarantees storage.transaction, so there is no
+-- minHostVersion 1.0.17 guarantees storage.transaction, so there is no
 -- per-key fallback.
 local function removeKeys(keys)
     if #keys == 0 then return true end
@@ -279,13 +281,14 @@ local function isQuotaError(err)
 end
 
 -- Oldest unpinned persisted entries, for quota eviction. Pins sort first, so
--- the unpinned tail is scanned from the end; session-only kinds have no key.
+-- the unpinned tail is scanned from the end; session-only rows have no key and
+-- free nothing.
 local function evictOldestStored(list, excludeId, max)
     local evicted = {}
     for index = #list, 1, -1 do
         if #evicted >= max then break end
         local entry = list[index]
-        if entry.kind == "text" and not entry.pinned
+        if entry.kind == "text" and not entry.pinned and not entry.sessionOnly
             and entry.id ~= excludeId then
             evicted[#evicted + 1] = entry.id
         end
@@ -334,6 +337,8 @@ local function addSessionEntry(model, entry)
     for _, kept in ipairs(sorted) do
         if kept.id == target then return target end
     end
+    -- The row lost the cap race (for example a pin-only history).
+    toast(model, l10n.tr("lua_widget.clipboard.toast_history_full"))
 end
 
 local function hasIdentity(model, text)
@@ -353,7 +358,10 @@ local function addTextEntry(model, text)
         end
     end
     -- A pin-only history can reject a new unpinned entry at the cap.
-    if not item then return end
+    if not item then
+        toast(model, l10n.tr("lua_widget.clipboard.toast_history_full"))
+        return
+    end
     if #item.text <= MAX_STORED_TEXT then
         -- Commit the new text and pruning together: a full quota must not leave
         -- the old entry deleted while the new one exists only in memory.
@@ -364,9 +372,17 @@ local function addTextEntry(model, text)
             -- before degrading to a session-only entry.
             local evicted = evictOldestStored(model.history, item.id, 8)
             if #evicted > 0 then
-                local merged = {}
-                for index = 1, #dropped do merged[#merged + 1] = dropped[index] end
-                for index = 1, #evicted do merged[#merged + 1] = evicted[index] end
+                local merged, queued = {}, {}
+                for index = 1, #dropped do
+                    queued[dropped[index]] = true
+                    merged[#merged + 1] = dropped[index]
+                end
+                for index = 1, #evicted do
+                    if not queued[evicted[index]] then
+                        queued[evicted[index]] = true
+                        merged[#merged + 1] = evicted[index]
+                    end
+                end
                 ok, err = pcall(historyStorage.write, storage.transaction,
                     item, merged, clipboard.encode)
                 if ok then
@@ -379,13 +395,23 @@ local function addTextEntry(model, text)
         if not ok then
             storageError(model, err)
             item.sessionOnly = true
-            model.history = clipboard.upsert(model.history, item, model.cfg.maxCount)
+            model.history = sorted
+            -- The pruned rows are gone from memory either way; drop their keys
+            -- so they cannot reappear on the next load.
+            if #dropped > 0 and not removeDropped({}, dropped) then
+                widget.log("warn", "clipboard: pruned keys kept")
+            end
             widget.invalidate()
-            return
+            return item
         end
-    elseif model.sessionNoticeAt ~= now then
-        model.sessionNoticeAt = now
-        toast(model, l10n.tr("lua_widget.clipboard.toast_session_text"))
+        -- The body now has a storage key, so the row is no longer session-only.
+        item.sessionOnly = nil
+    else
+        item.sessionOnly = true
+        if model.sessionNoticeAt ~= now then
+            model.sessionNoticeAt = now
+            toast(model, l10n.tr("lua_widget.clipboard.toast_session_text"))
+        end
     end
     model.history = sorted
     if #item.text > MAX_STORED_TEXT and #dropped > 0
@@ -393,9 +419,10 @@ local function addTextEntry(model, text)
         storageError(model, "storage remove failed")
     end
     widget.invalidate()
+    return item
 end
 
-local function toast(model, text)
+toast = function(model, text)
     model.toast = { text = text, at = time.monotonic() }
     schedule.after("toast", TOAST_MS)
     widget.invalidate()
@@ -522,12 +549,12 @@ end
 
 local function copyEntry(model, id)
     local entry = findEntry(model, id)
-    if not entry or hasPending(model, "write") then return end
+    if not entry or hasPending(model, "write") then return nil end
     if not canCopyEntry(entry) then
         if entry.kind == "image" then
             toast(model, l10n.tr("lua_widget.clipboard.toast_image_unavailable"))
         end
-        return
+        return nil
     end
     local arguments
     if entry.kind == "image" then
@@ -540,10 +567,11 @@ local function copyEntry(model, id)
     local taskId = task.start("clipboard.write", arguments)
     if not taskId then
         toast(model, l10n.tr("lua_widget.clipboard.toast_write_failed"))
-        return
+        return nil
     end
     model.tasks[taskId] = { kind = "write", entryId = id }
     widget.invalidate()
+    return taskId
 end
 
 local function deleteEntry(model, id)
@@ -590,6 +618,8 @@ local function pinEntry(model, id)
             storageError(model, err)
             return
         end
+        -- The row now has a storage key again; drop the "not saved" marker.
+        item.sessionOnly = nil
     end
     model.history = updated
     widget.invalidate()
@@ -607,6 +637,12 @@ local function clearHistory(model)
     if not changed then return false end
     if not removeKeys(keys) then
         storageError(model, "storage remove failed")
+        -- Earlier batches already committed; rebuild memory from what is left
+        -- so the card does not show rows the next load will not find.
+        if not pcall(loadHistory, model) then
+            widget.log("warn", "clipboard: history reload failed")
+        end
+        widget.invalidate()
         return false
     end
     model.history = remaining
@@ -616,7 +652,9 @@ local function clearHistory(model)
     end
     local pruned, dropped = clipboard.upsert(model.history, nil, model.cfg.maxCount)
     model.history = pruned
-    removeDropped({}, dropped)
+    if not removeDropped({}, dropped) then
+        storageError(model, "storage remove failed")
+    end
     widget.invalidate()
     return true
 end
@@ -662,7 +700,9 @@ local function buildFrame(model)
         end
         rows = matched
     end
-    local columns = contentWidth >= controlRow * 14 and 2 or 1
+    -- Two columns only when each cell keeps room for a title beside the row
+    -- chrome; below that a single wide column reads better.
+    local columns = contentWidth >= controlRow * 18 and 2 or 1
     local gap = columns > 1 and 12 * entryScale or 0
 
     return {
@@ -1039,6 +1079,7 @@ local function drawRow(f, entry, x, width, y, now, zh, nowParts)
     local radius = 10 * scale
     -- Reserve text room on narrow cards by compressing horizontal chrome.
     local insetScale = math.min(scale, width / (6 * 28))
+    local narrow = width < 210 * scale
     local key = "row." .. tostring(entry.id)
     local hovered = interaction.isHovered(key)
     local pressed = interaction.isPressed(key)
@@ -1052,8 +1093,8 @@ local function drawRow(f, entry, x, width, y, now, zh, nowParts)
     local copyable = canCopyEntry(entry)
     if glyphKind == "text" then glyphKind = clipboard.kindOfEntry(entry) end
     local tint = foregroundColor(TYPE_COLORS[glyphKind] or TYPE_COLORS.text, f.c.light)
-    local tile = 30 * insetScale
-    local tileX = x + 10 * insetScale
+    local tile = (narrow and 22 or 30) * insetScale
+    local tileX = x + (narrow and 7 or 10) * insetScale
     local tileY = y + (height - tile) / 2
     if entry.kind ~= "image" or not drawImagePreview(entry, tileX, tileY, tile, tile) then
         draw.rect(tileX, tileY, tile, tile, tint, 8 * insetScale, f.c.light and 0.075 or 0.09)
@@ -1061,10 +1102,14 @@ local function drawRow(f, entry, x, width, y, now, zh, nowParts)
             tile * 0.56, tint)
     end
 
-    local actionSize = 22 * insetScale
-    local actionGap = 3 * insetScale
-    local actionsX = x + width - 10 * insetScale - actionSize * 2 - actionGap
-    local textX = tileX + tile + 10 * insetScale
+    local actionSize = (narrow and 18 or 22) * insetScale
+    local actionGap = (narrow and 2 or 3) * insetScale
+    -- Reserve the copy slot only when the row offers a copy action; a pinned
+    -- row still needs the left slot for its pin badge.
+    local actionSlots = (copyable or entry.pinned) and 2 or 1
+    local actionsX = x + width - (narrow and 7 or 10) * insetScale
+        - actionSize * actionSlots - actionGap * (actionSlots - 1)
+    local textX = tileX + tile + (narrow and 7 or 10) * insetScale
     local titleMax = math.max(0, actionsX - 8 * insetScale - textX)
     local titleText = rowTitleCached(entry, zh)
     local titleKey = tostring(f.rowTitleFont) .. "\1" .. tostring(titleMax)
@@ -1114,7 +1159,8 @@ local function drawRow(f, entry, x, width, y, now, zh, nowParts)
         drawGlyph("pin", actionsX + actionSize / 2, actionY + actionSize / 2,
             actionSize * 14 / 22, f.c.accent)
     end
-    drawRowAction("delete." .. entry.id, actionsX + actionSize + actionGap,
+    drawRowAction("delete." .. entry.id,
+        actionsX + (actionSlots - 1) * (actionSize + actionGap),
         actionY, actionSize, "delete", f.c.muted,
         l10n.tr("lua_widget.clipboard.menu_delete"),
         l10n.tr("lua_widget.clipboard.menu_delete_hint"), entry.id)
@@ -1155,14 +1201,14 @@ local function drawEmpty(f, model)
     local titleKey = searching and "lua_widget.clipboard.search_empty_title"
         or (filter == "all" and "lua_widget.clipboard.empty_title"
         or "lua_widget.clipboard.empty_filter")
-    local font = f.compact and 12 or 14
-    local iconSize, gap = 17, 6
+    local font = math.max(f.compact and 12 or 14, math.floor(f.rowTitleFont + 0.5))
+    local iconSize, gap = math.max(17, math.floor(17 * f.entryScale + 0.5)), 6
     local width = f.right - f.left
     local title = ellipsize(l10n.tr(titleKey), font, width - iconSize - gap, false)
     local metrics = draw.measureText(title, font)
     local x = cx - (iconSize + gap + metrics.width) / 2
-    local showAction = not searching and f.bodyHeight >= 58
-    local buttonHeight = 26
+    local buttonHeight = math.max(26, math.floor(26 * f.entryScale + 0.5))
+    local showAction = not searching and f.bodyHeight >= 32 + buttonHeight
     local blockHeight = math.max(iconSize, metrics.height) + (showAction and 9 + buttonHeight or 0)
     local centerY = f.bodyTop + math.max(0, (f.bodyHeight - blockHeight) / 2)
         + math.max(iconSize, metrics.height) / 2
@@ -1177,7 +1223,7 @@ local function drawEmpty(f, model)
             or "lua_widget.clipboard.empty_action")
     local action = filter == "image" and "capture.image"
         or (filter == "files" and "capture.files" or "capture.refresh")
-    local buttonFont = 11
+    local buttonFont = math.max(11, math.floor(f.rowMetaFont + 0.5))
     local label = ellipsize(l10n.tr(actionKey), buttonFont, width - 20, true)
     local labelMetrics = draw.measureText(label, buttonFont, 0, true)
     local buttonWidth = labelMetrics.width + 20
@@ -1327,35 +1373,233 @@ local function render(_context, model)
     drawToast(f, model)
 end
 
+local PANEL_STATUS_KEYS = {
+    preview_saving = "lua_widget.clipboard.preview_saving",
+    preview_readonly = "lua_widget.clipboard.preview_readonly",
+    preview_dirty = "lua_widget.clipboard.preview_dirty",
+    preview_unchanged = "lua_widget.clipboard.preview_unchanged",
+    preview_saved = "lua_widget.clipboard.preview_saved",
+    preview_copied = "lua_widget.clipboard.preview_copied",
+    preview_failed = "lua_widget.clipboard.preview_failed",
+    preview_write_failed = "lua_widget.clipboard.preview_write_failed",
+    preview_copy_failed = "lua_widget.clipboard.preview_copy_failed",
+}
+
+local function panelStatusText(model, entry, dirty)
+    if entry.kind == "image" then
+        -- Images carry no draft: the status only reports handle availability.
+        if model.panelStatusKey and PANEL_STATUS_KEYS[model.panelStatusKey] then
+            return l10n.tr(PANEL_STATUS_KEYS[model.panelStatusKey])
+        end
+        return l10n.tr(canCopyEntry(entry)
+            and "lua_widget.clipboard.meta_image_session"
+            or "lua_widget.clipboard.toast_image_unavailable")
+    end
+    local key = model.panelStatusKey
+    if model.panelSaving then
+        key = "preview_saving"
+    elseif not key then
+        if #entry.text > PREVIEW_TEXT_MAX_BYTES then
+            key = "preview_readonly"
+        elseif dirty then
+            key = "preview_dirty"
+        else
+            key = "preview_unchanged"
+        end
+    end
+    local text = l10n.tr(PANEL_STATUS_KEYS[key] or PANEL_STATUS_KEYS.preview_unchanged)
+    -- The row's own marker knows whether this body has a storage key; length
+    -- alone would mislabel a persisted legacy body.
+    if entry.sessionOnly then
+        text = text .. " · " .. l10n.tr("lua_widget.clipboard.preview_session_only")
+    end
+    return text
+end
+
+-- Footer shared by every panel: status on the left, actions on the right.
+-- The host's panel title bar already carries the close button, so the footer
+-- never repeats it (the author's no-duplicate-actions rule).
+local function panelFooter(model, entry, color, height, dirty)
+    local children = {
+        view.text({
+            key = "preview.status",
+            text = panelStatusText(model, entry, dirty),
+            width = "fill", fontSize = 12,
+            style = { foreground = color.muted },
+        }),
+    }
+    local buttonHeight = 28
+    local function buttonWidth(label)
+        local ok, metrics = pcall(draw.measureText, label, 12, 0, true)
+        local textWidth = ok and metrics and metrics.width or (#label * 12)
+        return math.ceil(textWidth) + 24
+    end
+    -- The host draws a label from its line box; CJK glyphs carry side bearings
+    -- so the visual centre drifts. textInkAligned centres the visible glyph
+    -- bounds instead (same rule the card's own labels use).
+    local function labelOptions()
+        local options = { textAlign = "center", verticalAlign = "center" }
+        if INK_TEXT then options.textInkAligned = true end
+        return options
+    end
+    local function textButton(key, label, actionId)
+        local options = labelOptions()
+        options.key = key
+        options.label = label
+        options.width = buttonWidth(label)
+        options.height = buttonHeight
+        options.action = { id = actionId, value = entry.id }
+        options.accessibility = { label = label }
+        options.style = { cornerRadius = 7, borderWidth = 0 }
+        return view.button(options)
+    end
+    -- A write from this panel or any row keeps the footer actions disabled: the
+    -- host accepts one clipboard write at a time.
+    local busy = model.panelSaving or hasPending(model, "write")
+    if entry.kind == "text" then
+        -- An empty draft has nothing to save or copy; the actions stay hidden
+        -- instead of silently doing nothing.
+        local draftText = model.panelDraft or entry.text
+        if dirty and not busy and draftText ~= "" then
+            local label = l10n.tr("lua_widget.clipboard.preview_save")
+            local options = labelOptions()
+            options.key = "preview.save"
+            options.label = label
+            options.width = buttonWidth(label)
+            options.height = buttonHeight
+            options.action = { id = "preview.text.save", value = entry.id }
+            options.accessibility = { label = label }
+            options.style = {
+                background = color.accent,
+                foreground = color.accentInk,
+                cornerRadius = 7,
+                borderWidth = 0,
+            }
+            options.hoverStyle = {
+                background = color.accent, foreground = color.accentInk,
+            }
+            children[#children + 1] = view.button(options)
+        end
+        if not busy and draftText ~= "" then
+            children[#children + 1] = textButton("preview.copy",
+                l10n.tr("lua_widget.clipboard.preview_copy_draft"),
+                "preview.text.copy")
+        end
+    else
+        if canCopyEntry(entry) and not busy then
+            children[#children + 1] = textButton("preview.copy.image",
+                l10n.tr("lua_widget.clipboard.preview_copy"), "preview.image.copy")
+        end
+    end
+    return view.row({
+        key = "preview.footer", width = "fill", height = height,
+        gap = 8, alignItems = "center", children = children,
+    })
+end
+
+-- Hosts without declarative panels draw the footer themselves. The title-bar
+-- close button covers cancel, so the footer only carries the copy action.
+local function drawPanelFooterImmediate(model, entry, x, y, width, height, color)
+    local font = 12
+    local buttonHeight = 28
+    local buttonY = y + (height - buttonHeight) / 2
+    draw.text(x, y + (height - font) / 2, panelStatusText(model, entry, false),
+        font, color.muted, width * 0.45)
+    local label = entry.kind == "text"
+        and l10n.tr("lua_widget.clipboard.preview_copy_draft")
+        or l10n.tr("lua_widget.clipboard.preview_copy")
+    local copyable = not hasPending(model, "write")
+        and (entry.kind ~= "image" or canCopyEntry(entry))
+    if not copyable then return end
+    local actionId = entry.kind == "text" and "preview.text.copy"
+        or "preview.image.copy"
+    local textW = textWidth(label, font, true)
+    local buttonWidth = textW + 20
+    local bx = x + width - buttonWidth
+    draw.rect(bx, buttonY, buttonWidth, buttonHeight, color.accent, 7, 0.92)
+    draw.text(bx + (buttonWidth - textW) / 2, buttonY + (buttonHeight - font) / 2,
+        label, font, color.accentInk, 0, true, true, 0, 0.96)
+    interaction.region({
+        key = "preview." .. actionId,
+        shape = { type = "roundedRect", x = bx, y = buttonY,
+            width = buttonWidth, height = buttonHeight, radius = 7 },
+        cursor = "hand",
+        events = { click = { id = actionId, value = entry.id } },
+        accessibility = { role = "button", label = label },
+    })
+end
+
 local function panel(_context, model)
     local entry = model.panelEntry or model.requestedPanelEntry
     if not entry then return end
+    -- Watch or manual refresh can replace an image/file row with a new table
+    -- carrying fresh host handles; bind the panel to the live row.
+    local live = findEntry(model, entry.id)
+    if live then
+        entry = live
+        model.panelEntry = live
+    end
     local padding = 14
     local color = palette(widget.theme() or {})
-    if entry.kind == "text" and PREVIEW_EDITOR and #entry.text <= PREVIEW_TEXT_MAX_BYTES then
-        return view.box({
-            key = "preview.content",
-            width = "fill", height = "fill", padding = padding,
+    local width = layout.contentWidth() - padding * 2
+    local height = layout.contentHeight() - padding * 2
+    if width < 24 or height < 24 then return end
+    local footerHeight = 40
+    local contentHeight = math.max(1, height - footerHeight - 8)
+
+    local editable = entry.kind == "text" and PREVIEW_EDITOR
+        and #entry.text <= PREVIEW_TEXT_MAX_BYTES
+    if editable then
+        local draft = model.panelDraft or entry.text
+        return view.column({
+            key = "preview.root.edit", width = "fill", height = "fill",
+            gap = 6,
             children = {
                 view.textArea({
                     key = "preview.text.editor",
                     width = "fill", height = "fill",
-                    value = model.panelDraft or entry.text,
+                    value = draft,
                     maxBytes = PREVIEW_TEXT_MAX_BYTES,
+                    padding = 6,
                     liveUpdate = true,
                     action = { id = "preview.text.change", value = entry.id },
+                    events = { submit = { id = "preview.text.save", value = entry.id } },
                     accessibility = { label = l10n.tr("lua_widget.clipboard.preview_title") },
                     fontSize = 14,
                     style = { foreground = color.ink, background = color.surface, cornerRadius = 8 },
                 }),
+                panelFooter(model, entry, color, footerHeight,
+                    draft ~= entry.text),
             },
         })
     end
-    local width = layout.contentWidth() - padding * 2
-    local height = layout.contentHeight() - padding * 2
-    if width < 24 or height < 24 then return end
+    if entry.kind == "text" and PREVIEW_EDITOR and PREVIEW_SCROLL then
+        return view.column({
+            key = "preview.root.readonly", width = "fill", height = "fill",
+            gap = 6,
+            children = {
+                view.scroll({
+                    key = "preview.scroll", width = "fill",
+                    height = "fill",
+                    children = {
+                        view.text({
+                            key = "preview.body", width = "fill",
+                            text = entry.text,
+                            style = { foreground = color.ink },
+                        }),
+                    },
+                }),
+                panelFooter(model, entry, color, footerHeight, false),
+            },
+        })
+    end
+
+    -- Older hosts without declarative panels keep the immediate drawing path.
+    local footerY = padding + height - footerHeight
+    drawPanelFooterImmediate(model, entry, padding, footerY, width,
+        footerHeight, color)
     if entry.kind == "image" then
-        if not drawImagePreview(entry, padding, padding, width, height) then
+        if not drawImagePreview(entry, padding, padding, width, contentHeight) then
             draw.text(padding, padding, l10n.tr("lua_widget.clipboard.toast_image_unavailable"),
                 14, color.muted, width)
         end
@@ -1369,10 +1613,10 @@ local function panel(_context, model)
     end
     local scroll = interaction.scroll({
         key = "preview.text",
-        shape = { type = "rect", x = padding, y = padding, width = width, height = height },
-        contentHeight = math.min(1000000, math.max(math.ceil(height), model.panelTextHeight)),
+        shape = { type = "rect", x = padding, y = padding, width = width, height = contentHeight },
+        contentHeight = math.min(1000000, math.max(math.ceil(contentHeight), model.panelTextHeight)),
     })
-    draw.pushClip(padding, padding, textWidth, height)
+    draw.pushClip(padding, padding, textWidth, contentHeight)
     draw.text(padding, padding - scroll.offset, entry.text, 14, color.ink,
         textWidth, false, false, model.panelTextHeight)
     draw.popClip()
@@ -1395,6 +1639,8 @@ local function setup(context)
         searchQuery = "",
         copiedId = nil,
         pendingRefresh = nil,
+        panelSaving = false,
+        panelStatusKey = nil,
     }
     loadHistory(model)
     if not model.preview then storage.set("searchQuery", "") end
@@ -1544,6 +1790,134 @@ local function entryIdFrom(value)
     return tostring(value.value or "")
 end
 
+-- Preview actions -----------------------------------------------------------
+
+local function writeTextTask(model, text, entryId, extra)
+    if hasPending(model, "write") then return nil end
+    local taskId = task.start("clipboard.write", { format = "text", text = text })
+    if not taskId then return nil end
+    local job = { kind = "write", entryId = entryId, preview = true }
+    for key, value in pairs(extra or {}) do job[key] = value end
+    model.tasks[taskId] = job
+    return taskId
+end
+
+-- Terminal panel statuses clear after the same beat as the row copy mark, so a
+-- stale "Copied" never covers a newer "Edited" state.
+local function setPanelStatus(model, key)
+    model.panelStatusKey = key
+    model.panelStatusAt = key and (time.monotonic() + 2500) or nil
+    if key then
+        schedule.after("previewStatus", 2500)
+    else
+        schedule.cancel("previewStatus")
+    end
+end
+
+-- Shared tail of a save: start the clipboard write and mark the row copied only
+-- once the task actually started.
+local function startSavedCopy(model, entryId, text)
+    model.panelSaving = true
+    if not writeTextTask(model, text, entryId) then
+        model.panelSaving = false
+        setPanelStatus(model, "preview_write_failed")
+        return
+    end
+    model.copiedId = entryId
+    schedule.after("copiedMark", 2500)
+end
+
+-- Save replaces the history body (same id, pin and timestamp) and copies it.
+-- Merging into an existing identical entry keeps the next load's dedupe from
+-- silently dropping a row.
+local function savePreviewText(model)
+    local entry = model.panelEntry
+    if not entry or entry.kind ~= "text" or model.panelSaving
+        or hasPending(model, "write") then return end
+    local draft = model.panelDraft or entry.text
+    if draft == "" or draft == entry.text or #draft > PREVIEW_TEXT_MAX_BYTES then return end
+    local sessionOnly = #draft > MAX_STORED_TEXT
+    local updated, survivor, how = clipboard.replaceText(model.history,
+        entry.id, draft, sessionOnly)
+    if not survivor then
+        -- The row disappeared (watch prune, delete or clear) while the panel was
+        -- open: keep the draft by adding it back and bind the panel to that row.
+        local added = addTextEntry(model, draft)
+        if not added then
+            setPanelStatus(model, "preview_failed")
+        else
+            model.panelEntry = added
+            model.panelDraft = nil
+            setPanelStatus(model, "preview_saved")
+            startSavedCopy(model, added.id, draft)
+        end
+        widget.invalidate()
+        return
+    end
+    model.history = updated
+    local kept = findEntry(model, survivor)
+    local ok, err = true, nil
+    if how == "merged" then
+        -- The folded row's key is stale from here on. If it cannot be removed,
+        -- mirror the merged body under it so the next load's dedupe still sees
+        -- one text instead of resurrecting the old row.
+        if not pcall(storage.remove, "entry." .. entry.id) then
+            if kept then
+                local mirror = clipboard.copyEntry(kept)
+                mirror.id, mirror.text = entry.id, draft
+                pcall(persistEntry, mirror)
+            end
+            widget.log("warn", "clipboard preview: stale key mirrored")
+        end
+        if kept and #kept.text <= MAX_STORED_TEXT then
+            ok, err = pcall(persistEntry, kept)
+        end
+    elseif not sessionOnly and kept then
+        ok, err = pcall(persistEntry, kept)
+    elseif sessionOnly then
+        -- An over-budget body must not leave the older stored body behind:
+        -- dropping the key makes the restart loss explicit instead of reverting.
+        if not pcall(storage.remove, "entry." .. entry.id) then
+            widget.log("warn", "clipboard preview: stale key kept")
+        end
+    end
+    if not ok and kept and isQuotaError(err) then
+        -- Keep the edit for this session rather than losing it entirely.
+        kept.sessionOnly = true
+        ok, err = true, nil
+    end
+    if not ok then
+        -- The body is already in memory; mark the row so it reads "not saved".
+        if kept then kept.sessionOnly = true end
+        model.panelEntry = kept or model.panelEntry
+        storageError(model, err)
+        setPanelStatus(model, "preview_failed")
+        widget.invalidate()
+        return
+    end
+    model.panelEntry = kept
+    model.panelDraft = nil
+    setPanelStatus(model, "preview_saved")
+    startSavedCopy(model, survivor, draft)
+    widget.invalidate()
+end
+
+local function copyPreviewText(model)
+    local entry = model.panelEntry
+    if not entry or entry.kind ~= "text" or model.panelSaving
+        or hasPending(model, "write") then return end
+    local draft = model.panelDraft or entry.text
+    if draft == "" then return end
+    if not writeTextTask(model, draft, entry.id, { copiedDraft = true }) then
+        setPanelStatus(model, "preview_copy_failed")
+    else
+        -- Block a save from overlapping the in-flight copy.
+        model.panelSaving = true
+        setPanelStatus(model, "preview_copied")
+    end
+    widget.invalidate()
+end
+
 local function handleAction(model, value)
     local id = tostring(value.id or "")
     if id == "capture.refresh" then
@@ -1600,6 +1974,29 @@ local function handleAction(model, value)
             value.value == entry.id and type(value.text) == "string" and
             #value.text <= PREVIEW_TEXT_MAX_BYTES then
             model.panelDraft = value.text
+            setPanelStatus(model, nil)
+            widget.invalidate()
+        end
+    elseif id == "preview.text.save" then
+        if value.surface == "panel" then savePreviewText(model) end
+    elseif id == "preview.text.copy" then
+        if value.surface == "panel" then copyPreviewText(model) end
+    elseif id == "preview.image.copy" then
+        local entry = model.panelEntry
+        if value.surface == "panel" and entry and entry.kind == "image" then
+            local taskId = copyEntry(model, entry.id)
+            if taskId then
+                -- The panel reuses the row copy task; mark it so its completion
+                -- refreshes the panel status instead of only the row mark.
+                local job = model.tasks[taskId]
+                if job then
+                    job.preview = true
+                    job.copiedDraft = true
+                end
+                setPanelStatus(model, "preview_copied")
+            else
+                setPanelStatus(model, "preview_copy_failed")
+            end
             widget.invalidate()
         end
     elseif id == "entry.copy" or id:sub(1, 11) == "entry.copy:" then
@@ -1620,6 +2017,23 @@ local function handleTask(model, value)
 
     if not value.ok or type(value.value) ~= "table" then
         local err = tostring(value.error or "readFailed")
+        if job.preview then
+            model.panelSaving = false
+            -- A save marks the row as copied before the write completes; a
+            -- failed write must take that mark back.
+            if model.copiedId == job.entryId then
+                model.copiedId = nil
+                schedule.cancel("copiedMark")
+            end
+            local entry = model.panelEntry
+            if entry and entry.id == job.entryId then
+                setPanelStatus(model, job.copiedDraft and "preview_copy_failed"
+                    or "preview_write_failed")
+            end
+            widget.log("warn", "clipboard preview write: " .. err)
+            widget.invalidate()
+            return
+        end
         if job.kind == "read" then
             -- Known host codes map to localized text; the raw code stays in the
             -- log for diagnosis.
@@ -1639,6 +2053,23 @@ local function handleTask(model, value)
 
     local result = value.value
     if job.kind == "write" then
+        if job.preview then
+            model.panelSaving = false
+            local entry = model.panelEntry
+            if entry and entry.id == job.entryId then
+                if job.copiedDraft then
+                    setPanelStatus(model, "preview_copied")
+                elseif model.panelDraft ~= nil then
+                    -- Edits that arrived while the write was in flight win: the
+                    -- footer keeps showing Save and the dirty state.
+                    setPanelStatus(model, nil)
+                else
+                    setPanelStatus(model, "preview_saved")
+                end
+            end
+            widget.invalidate()
+            return
+        end
         model.copiedId = job.entryId
         schedule.after("copiedMark", 2500)
         toast(model, l10n.tr("lua_widget.clipboard.toast_copied"))
@@ -1716,9 +2147,16 @@ local function onClipboardChange(model, value)
         model.watchKind = "image"
     elseif value.format == "file-names" and model.cfg.captureFiles then
         local names = {}
-        for index, name in ipairs(value.names) do
-            names[index] = clipboard.truncate(name, 256)
+        if type(value.names) == "table" then
+            for index = 1, #value.names do
+                local name = value.names[index]
+                if type(name) ~= "string" or name == "" then break end
+                names[#names + 1] = clipboard.truncate(name, 256)
+            end
         end
+        -- Host payloads without usable names would otherwise build a files row
+        -- with no title and no path references.
+        if #names == 0 then return end
         local now = time.now()
         local entry = {
             id = nextId(model, now), ts = now, pinned = false,
@@ -1754,10 +2192,14 @@ local function event(_context, model, value)
             model.panelEntry = model.requestedPanelEntry
             model.requestedPanelEntry = nil
             model.panelDraft = nil
+            model.panelSaving = false
+            model.panelStatusKey = nil
         elseif value.action == "closed" then
             model.panelEntry = nil
             model.panelTextEntry = nil
             model.panelDraft = nil
+            model.panelSaving = false
+            model.panelStatusKey = nil
         end
         return
     end
@@ -1774,6 +2216,13 @@ local function event(_context, model, value)
         elseif value.id == "copiedMark" then
             model.copiedId = nil
             widget.invalidate()
+        elseif value.id == "previewStatus" then
+            if model.panelStatusKey
+                and time.monotonic() >= (model.panelStatusAt or 0) then
+                model.panelStatusKey = nil
+                model.panelStatusAt = nil
+                widget.invalidate()
+            end
         end
         return
     end
@@ -1804,6 +2253,7 @@ local function dispose(_context, model)
     schedule.cancel("clearConfirm")
     schedule.cancel("captureNext")
     schedule.cancel("copiedMark")
+    schedule.cancel("previewStatus")
     model.captureGeneration = (model.captureGeneration or 0) + 1
     model.captureActive = false
     model.captureBatch = nil

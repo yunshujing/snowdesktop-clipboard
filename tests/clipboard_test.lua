@@ -181,7 +181,7 @@ return {
         same(kept[2].id, "other", "other entry survives refresh")
         same(#kept, 2, "cap remains two")
         same(#dropped, 0, "refresh does not add an entry")
-        same(#dropped, 0, "refresh does not add an entry")
+        same(kept[1].ts, 300, "refreshed timestamp at the cap")
         local unchanged, none = clipboard.upsert(kept, nil, 2)
         same(#unchanged, 2, "no-op prune")
         same(#none, 0, "no-op delete list")
@@ -299,6 +299,86 @@ return {
         same(#shrunk, 10, "shrink to 10")
         same(#pruned, 190, "all excess reported for storage removal")
         same(shrunk[1].id, "new", "newest survives shrink")
+    end,
+
+    ["reports duplicate bodies folded by a refresh"] = function()
+        local list = {
+            entry("a", 100, false, "same"),
+            entry("b", 120, false, "same"),
+            entry("c", 200, false, "other"),
+        }
+        local kept, dropped = clipboard.upsert(list,
+            entry("new", 300, false, "same"), 10)
+        same(#kept, 2, "one row per body")
+        same(kept[1].id, "a", "first duplicate survives")
+        same(dropped[1], "b", "folded duplicate reported for key removal")
+        same(#dropped, 1, "a single stale key")
+    end,
+
+    ["replaces a text body keeping id, pin and timestamp"] = function()
+        local list = {
+            entry("a", 100, true, "original"),
+            entry("b", 200, false, "other"),
+        }
+        local nextList, survivor, how = clipboard.replaceText(list, "a",
+            "edited")
+        same(how, "replaced", "mode")
+        same(survivor, "a", "id kept")
+        same(nextList[1].id, "a", "still pinned first")
+        same(nextList[1].pinned, true, "pin kept")
+        same(nextList[1].ts, 100, "timestamp kept")
+        same(nextList[1].text, "edited", "body replaced")
+        same(list[1].text, "original", "input not mutated")
+        local missing, none = clipboard.replaceText(list, "zz", "x")
+        same(missing, list, "missing id returns the same list")
+        same(none, nil, "missing id reports nil")
+    end,
+
+    ["drops cached row fields when the body changes"] = function()
+        local list = { entry("a", 100, false, "https://a.test") }
+        list[1]._kind = "link"
+        list[1]._searchLower = "https://a.test"
+        list[1]._title, list[1]._titleAt = "https://a.test", "zh\1t"
+        list[1]._titleFit, list[1]._metaFit = { key = "old" }, { key = "old" }
+        local nextList = clipboard.replaceText(list, "a", "local x = 1")
+        same(nextList[1]._kind, nil, "kind cache cleared")
+        same(nextList[1]._searchLower, nil, "search cache cleared")
+        same(nextList[1]._title, nil, "title cache cleared")
+        same(nextList[1]._titleAt, nil, "title key cleared")
+        same(nextList[1]._titleFit, nil, "fit cache cleared")
+        same(nextList[1]._metaFit, nil, "meta cache cleared")
+        same(clipboard.kindOfEntry(nextList[1]), "code", "reclassifies")
+    end,
+
+    ["marks an oversized replacement as session only"] = function()
+        local list = { entry("a", 100, false, "short") }
+        local nextList = clipboard.replaceText(list, "a", "big", true)
+        truthy(nextList[1].sessionOnly, "session marker set")
+        local kept = clipboard.replaceText(list, "a", "small", false)
+        truthy(not kept[1].sessionOnly, "marker stays clear otherwise")
+        local stale = { { id = "b", ts = 100, pinned = false, kind = "text",
+            text = "old", sessionOnly = true } }
+        local cleared = clipboard.replaceText(stale, "b", "small", false)
+        truthy(not cleared[1].sessionOnly,
+            "an oversized body that shrank loses the session marker")
+    end,
+
+    ["folds an edit into an entry that already holds the text"] = function()
+        local list = {
+            entry("target", 100, true, "original"),
+            entry("other", 200, false, "duplicate body"),
+        }
+        local nextList, survivor, how = clipboard.replaceText(list, "target",
+            "duplicate body")
+        same(how, "merged", "mode")
+        same(survivor, "other", "surviving id")
+        same(#nextList, 1, "one row remains")
+        same(nextList[1].id, "other", "kept the pre-existing row")
+        same(nextList[1].pinned, true, "pin folded in")
+        same(nextList[1].text, "duplicate body", "body untouched")
+        local large = clipboard.replaceText(list, "target", "duplicate body",
+            true)
+        truthy(large[1].sessionOnly, "merged over-budget body is session only")
     end,
 
     ["filters and counts"] = function()

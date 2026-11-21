@@ -126,6 +126,7 @@ end
 -- ids stay stable so a menu opened before the refresh still resolves.
 function clipboard.upsert(list, newEntry, maxCount)
     local result, previous, refreshed = {}, {}, nil
+    local folded = {}
     if newEntry and newEntry.kind == "text" then
         for index = 1, #list do
             local item = list[index]
@@ -136,6 +137,10 @@ function clipboard.upsert(list, newEntry, maxCount)
                         kind = item.kind, text = newEntry.text,
                         sessionOnly = newEntry.sessionOnly or item.sessionOnly,
                     }
+                else
+                    -- Further rows with the same body fold into the first one;
+                    -- their keys go stale and ride out with the prune list.
+                    folded[#folded + 1] = item.id
                 end
             else
                 previous[#previous + 1] = item
@@ -154,6 +159,7 @@ function clipboard.upsert(list, newEntry, maxCount)
         -- A refreshed text is no longer in `previous`, so it cannot be pruned
         -- under its old timestamp. Pins still outrank every unpinned entry.
         local dropped, drop = {}, {}
+        for index = 1, #folded do dropped[#dropped + 1] = folded[index] end
         local remaining = #sorted - maxCount
         previous = clipboard.sorted(previous)
         for index = #previous, 1, -1 do
@@ -178,7 +184,65 @@ function clipboard.upsert(list, newEntry, maxCount)
         end
         return clipboard.sorted(kept), dropped
     end
-    return sorted, {}
+    return sorted, folded
+end
+
+-- Replace a text entry's body, keeping its id, pin and original timestamp so
+-- the row does not jump. When another entry already holds the edited text the
+-- edited row folds into that one (pin wins) — otherwise the next load's
+-- dedupeText would silently drop one of the two.
+-- Returns the new list, the surviving id and "replaced" | "merged" | nil.
+function clipboard.replaceText(list, id, text, sessionOnly)
+    local target, duplicate
+    for index = 1, #list do
+        local item = list[index]
+        if item.kind == "text" then
+            if item.id == id then
+                target = item
+            elseif item.text == text then
+                duplicate = item
+            end
+        end
+    end
+    if not target then return list, nil, nil end
+    if duplicate then
+        local result = {}
+        for index = 1, #list do
+            local item = list[index]
+            if item.id == id then
+                -- folded into the duplicate below
+            elseif item.id == duplicate.id then
+                local merged = clipboard.copyEntry(item)
+                merged.pinned = item.pinned or target.pinned
+                merged.pinnedAt = merged.pinned and (item.pinnedAt or target.pinnedAt) or nil
+                -- Only an over-budget body is session-only; a stored body keeps
+                -- its persisted state so the row does not claim it is unsaved.
+                merged.sessionOnly = sessionOnly and true or nil
+                result[#result + 1] = merged
+            else
+                result[#result + 1] = item
+            end
+        end
+        return clipboard.sorted(result), duplicate.id, "merged"
+    end
+    local result = {}
+    for index = 1, #list do
+        local item = list[index]
+        if item.id == id then
+            local updated = clipboard.copyEntry(item)
+            updated.text = text
+            -- Derived fields key off the body; drop them so the row redraws the
+            -- new title, classification, fit and search text.
+            updated._kind, updated._searchLower = nil, nil
+            updated._title, updated._titleAt, updated._titleFit = nil, nil, nil
+            updated._metaFit = nil
+            if sessionOnly then updated.sessionOnly = true else updated.sessionOnly = nil end
+            result[#result + 1] = updated
+        else
+            result[#result + 1] = item
+        end
+    end
+    return result, id, "replaced"
 end
 
 function clipboard.removeId(list, id)

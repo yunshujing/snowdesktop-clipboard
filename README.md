@@ -9,9 +9,9 @@
 ## 功能
 
 - **文本自动记录**：在其它应用里复制后自动进入历史，链接与代码有独立图标。
-- **搜索**：卡片内搜索框按关键词即时过滤全部历史（文本按全文匹配，图片和文件按标题匹配）。
-- **预览与复制**：点击文本或图片条目打开预览。复制按钮与右键菜单可以把内容写回剪贴板。可用的图片还可拖到接收位图或 PNG 附件的窗口。
-- **编辑文字预览**：在多行文本框里编辑并复制所选文字。草稿随弹窗关闭而清除，原历史条目保留。支持 `view.textArea.largeValue` 的宿主可编辑现有 256 KiB 限额内的文本。
+- **搜索**：卡片内搜索框按关键词即时过滤当前分类（文本按全文匹配，图片和文件按标题匹配）。
+- **预览与复制**：点击文本或图片条目打开预览。面板底部提供「保存并复制」「仅复制草稿」；复制按钮与右键菜单也可以把内容写回剪贴板，关闭面板即放弃未保存的草稿。可用的图片还可拖到接收位图或 PNG 附件的窗口。
+- **编辑文字预览**：在多行文本框里编辑；「保存并复制」会用草稿替换历史原文（通常保留 ID、置顶与时间戳；若与另一条历史相同则合并到该条，以该条的 ID 和时间戳为准）并写回剪贴板，Ctrl+Enter 同效；「仅复制草稿」只写回、不改历史。关窗丢弃未保存草稿。支持 `view.textArea.largeValue` 的宿主可编辑现有 256 KiB 限额内的文本；超过 48 KiB 的编辑仅保留在本次会话。
 - **文件记录**：显示文件展示名和数量。支持文件地址的宿主可以复制完整路径，多项各占一行。
 - **去重**：宿主提供图片内容 ID 或文件引用时，相同内容会更新原条目并保留置顶。
 - **图片优先识别**：剪贴板同时包含图片像素和 `CF_HDROP` 时优先按图片处理，不再把复制图片误记为文件。
@@ -59,7 +59,7 @@
 - 需要支持 `data.clipboard.changes` 的 SnowDesktop 1.0.17.0 或更新版本（API v2）。旧宿主请使用组件 1.0.4。
 - 支持 `data.clipboard.changes.image` 的宿主可以写回近期后台图片。只有基础订阅能力的宿主可通过右键标题手动读取并写回当前图片。
 - 图片去重需要宿主支持 `clipboard.imageIdentity`。
-- 原始尺寸、直接拖出和复制文件地址分别检测 `clipboard.image.originalSize`、`interaction.dragImage` 和 `clipboard.filePaths`。
+- 直接拖出和复制文件地址分别检测 `interaction.dragImage` 和 `clipboard.filePaths`；宿主提供原始尺寸时按原图尺寸写回。
 - 无网络请求、无外部服务。
 - 核心能力：即时绘制、滚动区域、右键菜单、剪贴板订阅、定时任务、本地化和组件存储。
 
@@ -67,7 +67,7 @@
 
 ```powershell
 snowwidget lint    .
-snowwidget test    .      # 22 个用例：文本模型、缩略图解码、独立记录、刷新补全、存储
+snowwidget test    .      # 27 个用例：文本模型、缩略图解码、独立记录、刷新补全、存储
 snowwidget preview . preview.png --columns 3 --rows 3 --canvas-size 512 --padding 32 --appearance glass-dark --locale zh-CN
 snowwidget quality .
 snowwidget pack    . clipboard.snowwidget
@@ -87,7 +87,7 @@ tests/                   snowwidget 单元测试
 ### 设计要点
 
 - 后台记录由宿主 `clipboard.changes` 订阅驱动。手动刷新在可信手势中调用 `clipboard.read`。
-- 每条已收到的图片或文件事件都会追加历史。刷新任务携带当前监听条目 ID，补全对应记录。
+- 收到图片或文件事件时追加历史；宿主提供内容 ID 或文件引用时更新对应条目，不重复追加。刷新任务携带当前监听条目 ID，补全对应记录。
 - 历史文本使用 `entry.<timestamp>-<seq>` 存储键，插入与淘汰通过 `storage.transaction` 原子提交。
 
 ## License
